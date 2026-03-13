@@ -2,16 +2,14 @@
 umask 077
 
 usage() {
-    echo "Usage: $(basename "$0")"
+    echo "Usage: $(basename "$0") [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  -s, --min-size MB   Minimum directory size to consider (default: 10)"
+    echo "  -h, --help          Show this help message"
     echo ""
     echo "Move large directories from \$HOME to sgoinfre/goinfre and replace with symlinks."
-    echo ""
-    echo "Log file: \$HOME/homemover_script.log"
 }
-
-case "${1:-}" in
-    -h|--help) usage; exit 0 ;;
-esac
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -24,11 +22,38 @@ NC='\033[0m'
 trap 'echo -e "\n${RED}Interrupted by user. Exiting...${NC}"; exit 130' SIGINT
 
 LOG_FILE="$HOME/homemover_script.log"
-MIN_SIZE_MB=${1:-0}
+MIN_SIZE_MB=${1:-10}
 
 USER_ID=$(whoami)
 TOTAL_MOVED_MB=0
+10
 
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -s|--min-size)
+            MIN_SIZE_MB="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            usage
+            exit 1
+            ;;
+        *)
+            echo "Unexpected argument: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+done
 # Initialize log file (Append mode)
 : >> "$LOG_FILE"
 chmod 600 "$LOG_FILE" 2>/dev/null
