@@ -1,4 +1,5 @@
 #!/bin/bash
+umask 077
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -70,6 +71,43 @@ get_size_mb() {
     echo $((${size_kb:-0} / 1024))
 }
 
+assert_safe_path() {
+    local path="$1"
+    local allowed_prefix="$2"
+    local real_path
+    real_path=$(realpath -e -- "$path" 2>/dev/null) || return 1
+    local real_prefix
+    real_prefix=$(realpath -e -- "$allowed_prefix" 2>/dev/null) || return 1
+    
+    # Must start with prefix and not be the prefix itself
+    if [[ "$real_path" == "$real_prefix"/* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+verify_copy() {
+    local src="$1"
+    local dest="$2"
+    local src_count dest_count src_size dest_size
+    src_count=$(find "$src" -type f 2>/dev/null | wc -l)
+    dest_count=$(find "$dest" -type f 2>/dev/null | wc -l)
+    src_size=$(du -sk "$src" 2>/dev/null | awk '{print $1}')
+    dest_size=$(du -sk "$dest" 2>/dev/null | awk '{print $1}')
+    
+    if [ "$src_count" -ne "$dest_count" ]; then
+        log_msg "    ${RED}[VERIFY FAILED]${NC} File count mismatch: src=$src_count dest=$dest_count"
+        log_res "VERIFY FAILED (file count: src=$src_count dest=$dest_count)"
+        return 1
+    fi
+    if [ "$src_size" -ne "$dest_size" ]; then
+        log_msg "    ${RED}[VERIFY FAILED]${NC} Size mismatch: src=${src_size}K dest=${dest_size}K"
+        log_res "VERIFY FAILED (size: src=${src_size}K dest=${dest_size}K)"
+        return 1
+    fi
+    return 0
+}
+
 move_and_link() {
     local src="$1"
     local rel="${src#$HOME/}"
@@ -96,9 +134,23 @@ move_and_link() {
     echo ""
     
     if [ $status -eq 0 ]; then
-        log_res "SUCCESS"
+        log_res "COPY SUCCESS"
+        
+        if ! verify_copy "$src" "$dest"; then
+            log_msg "    ${YELLOW}Cleaning up unverified copy...${NC}"
+            log_cmd "rm -rf \"$dest\" (cleanup after verify failure)"
+            rm -rf "$dest"
+            return 1
+        fi
+        
         local size_mb=$(get_size_mb "$dest")
         TOTAL_MOVED_MB=$((TOTAL_MOVED_MB + size_mb))
+        
+        if ! assert_safe_path "$src" "$HOME"; then
+            log_msg "    ${RED}[SECURITY]${NC} Path validation failed for src: $src"
+            log_res "ABORTED (unsafe src path)"
+            return 1
+        fi
         
         log_cmd "rm -rf \"$src\""
         rm -rf "$src"

@@ -1,4 +1,5 @@
 #!/bin/bash
+umask 077
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -41,6 +42,42 @@ get_size_mb() {
     echo $((${size_kb:-0} / 1024))
 }
 
+assert_safe_path() {
+    local path="$1"
+    local allowed_prefix="$2"
+    local real_path
+    real_path=$(realpath -e -- "$path" 2>/dev/null) || return 1
+    local real_prefix
+    real_prefix=$(realpath -e -- "$allowed_prefix" 2>/dev/null) || return 1
+    
+    if [[ "$real_path" == "$real_prefix"/* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+verify_copy() {
+    local src="$1"
+    local dest="$2"
+    local src_count dest_count src_size dest_size
+    src_count=$(find "$src" -type f 2>/dev/null | wc -l)
+    dest_count=$(find "$dest" -type f 2>/dev/null | wc -l)
+    src_size=$(du -sk "$src" 2>/dev/null | awk '{print $1}')
+    dest_size=$(du -sk "$dest" 2>/dev/null | awk '{print $1}')
+    
+    if [ "$src_count" -ne "$dest_count" ]; then
+        log_msg "    ${RED}[VERIFY FAILED]${NC} File count mismatch: src=$src_count dest=$dest_count"
+        log_res "VERIFY FAILED (file count: src=$src_count dest=$dest_count)"
+        return 1
+    fi
+    if [ "$src_size" -ne "$dest_size" ]; then
+        log_msg "    ${RED}[VERIFY FAILED]${NC} Size mismatch: src=${src_size}K dest=${dest_size}K"
+        log_res "VERIFY FAILED (size: src=${src_size}K dest=${dest_size}K)"
+        return 1
+    fi
+    return 0
+}
+
 bring_back() {
     local symlink_path="$1"
     local target_path="$2"
@@ -61,10 +98,11 @@ bring_back() {
 
     log_msg "    ${BLUE}Restoring to home directory...${NC}"
     
-    # Use a temp dir so a crash doesn't leave us with data in neither place
-    local tmp_dest="$(dirname "$symlink_path")/.bring_back_tmp_${rel##*/}"
+    # Use mktemp for crash-safe unique temp dir on the same filesystem
+    local tmp_dest
+    tmp_dest=$(mktemp -d "$(dirname "$symlink_path")/.bring_back_tmp.${rel##*/}.XXXXXX")
     
-    log_cmd "rsync/cp -ahXA --info=progress2 --no-inc-recursive \"$target_path/\" \"$tmp_dest\""
+    log_cmd "rsync/cp \"$target_path/\" \"$tmp_dest\""
     if command -v rsync >/dev/null 2>&1; then
         rsync -ahXA --info=progress2 --no-inc-recursive "$target_path/" "$tmp_dest"
     else
@@ -75,7 +113,15 @@ bring_back() {
     echo ""
     
     if [ $status -eq 0 ]; then
-        log_res "SUCCESS"
+        log_res "COPY SUCCESS"
+        
+        if ! verify_copy "$target_path" "$tmp_dest"; then
+            log_msg "    ${YELLOW}Cleaning up unverified copy...${NC}"
+            log_cmd "rm -rf \"$tmp_dest\" (cleanup after verify failure)"
+            rm -rf "$tmp_dest"
+            return 1
+        fi
+        
         TOTAL_RESTORED_MB=$((TOTAL_RESTORED_MB + size_mb))
         
         # Only now it's safe to remove the symlink and rename tmp
@@ -85,6 +131,12 @@ bring_back() {
         log_cmd "mv \"$tmp_dest\" \"$symlink_path\""
         mv "$tmp_dest" "$symlink_path"
         
+        if ! assert_safe_path "$target_path" "/sgoinfre" && ! assert_safe_path "$target_path" "/goinfre"; then
+            log_msg "    ${RED}[SECURITY]${NC} Path validation failed for target: $target_path"
+            log_res "ABORTED (unsafe target path, data restored but external not cleaned)"
+            return 1
+        fi
+        
         log_cmd "rm -rf \"$target_path\""
         rm -rf "$target_path"
         
@@ -92,7 +144,7 @@ bring_back() {
     else
         log_res "FAILED (Exit Code: $status)"
         log_msg "    ${RED}[ERROR]${NC} Failed to restore ~/$rel! (symlink untouched)"
-        # Clean up tmp if it was partially created
+        log_cmd "rm -rf \"$tmp_dest\" (cleanup after failed copy)"
         rm -rf "$tmp_dest"
     fi
 }
