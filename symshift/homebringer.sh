@@ -1,6 +1,28 @@
 #!/bin/bash
 umask 077
 
+usage() {
+    echo "Usage: $(basename "$0") [OPTIONS]"
+    echo ""
+    echo "Restore symlinked directories from sgoinfre/goinfre back to \$HOME."
+    echo ""
+    echo "Options:"
+    echo "  -h, --help         Show this help message and exit"
+    echo ""
+    echo "Environment Variables:"
+    echo "  VERIFY_MODE        Copy verification mode: 'full' (default) or 'size' (skip file count)"
+    echo ""
+    echo "Examples:"
+    echo "  $(basename "$0")                    # Scan and restore interactively"
+    echo "  VERIFY_MODE=size $(basename "$0")    # Skip file count verification"
+    echo ""
+    echo "Log file: \$HOME/homemover_script.log"
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+esac
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -10,7 +32,6 @@ NC='\033[0m'
 
 LOG_FILE="$HOME/homemover_script.log"
 TOTAL_RESTORED_MB=0
-MIN_SIZE_MB=${1:-0}
 
 log_msg() {
     echo -e "$1"

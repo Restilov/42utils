@@ -1,6 +1,32 @@
 #!/bin/bash
 umask 077
 
+usage() {
+    echo "Usage: $(basename "$0") [OPTIONS] [MIN_SIZE_MB]"
+    echo ""
+    echo "Move large directories from \$HOME to sgoinfre/goinfre and replace with symlinks."
+    echo ""
+    echo "Arguments:"
+    echo "  MIN_SIZE_MB        Minimum directory size in MB to be listed as candidate (default: 50)"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help         Show this help message and exit"
+    echo ""
+    echo "Environment Variables:"
+    echo "  VERIFY_MODE        Copy verification mode: 'full' (default) or 'size' (skip file count)"
+    echo ""
+    echo "Examples:"
+    echo "  $(basename "$0")             # List directories >= 50 MB"
+    echo "  $(basename "$0") 100         # List directories >= 100 MB"
+    echo "  VERIFY_MODE=size $(basename "$0")   # Skip file count verification"
+    echo ""
+    echo "Log file: \$HOME/homemover_script.log"
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+esac
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -62,8 +88,9 @@ log_msg "${RED}${BOLD}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 log_msg "                      DATA LOSS WARNING"
 log_msg "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${NC}"
 log_msg "${YELLOW}sgoinfre/goinfre drives can be wiped by the system at any time."
-log_msg "This script frees up your quota by moving large directories."
-log_msg "Minimum size threshold: ${BLUE}$MIN_SIZE_MB MB${NC}"
+log_msg "This script frees up your quota by moving large directories.${NC}\n"
+usage
+log_msg "\n${BLUE}Minimum size threshold: ${BOLD}$MIN_SIZE_MB MB${NC}"
 log_msg "${RED}${BOLD}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${NC}\n"
 
 log_msg "--- Homemover Script Started (Min Size: $MIN_SIZE_MB MB) ---"
