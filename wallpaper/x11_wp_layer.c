@@ -10,8 +10,14 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <time.h>
 #include <jpeglib.h>
 #include <png.h>
+
+#define DEFAULT_FPS 10
+#define MAX_FPS 60
+#define MAX_FRAMES 300
 
 enum {
     EXIT_OK = 0,
@@ -20,9 +26,10 @@ enum {
 };
 
 static volatile sig_atomic_t g_running = 1;
+static char g_temp_dir[256] = {0};
 
 static void print_usage(const char *program_name) {
-    fprintf(stderr, "Usage: %s <image.(jpg|jpeg|png)> [--foreground]\n", program_name);
+    fprintf(stderr, "Usage: %s <image.(jpg|jpeg|png)|video.(mp4|mkv|avi|webm|mov|gif)|directory> [--fps N] [--foreground]\n", program_name);
 }
 
 static void signal_handler(int signum) {
@@ -232,6 +239,31 @@ static bool extension_equals(const char *extension, const char *value) {
     return *extension == '\0' && *value == '\0';
 }
 
+static bool is_supported_image(const char *filename) {
+    const char *ext = get_file_extension(filename);
+    return extension_equals(ext, "jpg") ||
+           extension_equals(ext, "jpeg") ||
+           extension_equals(ext, "png");
+}
+
+static bool is_video_file(const char *filename) {
+    const char *ext = get_file_extension(filename);
+    return extension_equals(ext, "mp4") ||
+           extension_equals(ext, "mkv") ||
+           extension_equals(ext, "avi") ||
+           extension_equals(ext, "webm") ||
+           extension_equals(ext, "mov") ||
+           extension_equals(ext, "gif");
+}
+
+static int extract_video_frames(const char *video_path, const char *out_dir, int fps) {
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+             "ffmpeg -i \"%s\" -vf fps=%d \"%s/frame_%%04d.png\" -y 2>/dev/null",
+             video_path, fps, out_dir);
+    return system(cmd);
+}
+
 static unsigned char *read_image_as_bgra(const char *filename, int *width, int *height) {
     const char *extension = get_file_extension(filename);
 
@@ -306,6 +338,188 @@ static unsigned char *scale_bgra_cover(
     }
 
     return dst_pixels;
+}
+
+static int compare_strings(const void *a, const void *b) {
+    return strcmp(*(const char **)a, *(const char **)b);
+}
+
+static int load_frame_paths(const char *dirpath, char ***out_paths, int *out_count) {
+    DIR *dir = opendir(dirpath);
+    if (!dir)
+        return -1;
+
+    char **paths = NULL;
+    int count = 0;
+    int capacity = 0;
+    size_t dirlen = strlen(dirpath);
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.')
+            continue;
+        if (!is_supported_image(entry->d_name))
+            continue;
+
+        if (count >= capacity) {
+            capacity = capacity ? capacity * 2 : 64;
+            char **tmp = realloc(paths, (size_t)capacity * sizeof(*paths));
+            if (!tmp) {
+                for (int i = 0; i < count; ++i)
+                    free(paths[i]);
+                free(paths);
+                closedir(dir);
+                return -1;
+            }
+            paths = tmp;
+        }
+
+        size_t namelen = strlen(entry->d_name);
+        bool need_slash = (dirlen > 0 && dirpath[dirlen - 1] != '/');
+        size_t pathlen = dirlen + (need_slash ? 1 : 0) + namelen + 1;
+        char *fullpath = malloc(pathlen);
+        if (!fullpath) {
+            for (int i = 0; i < count; ++i)
+                free(paths[i]);
+            free(paths);
+            closedir(dir);
+            return -1;
+        }
+
+        if (need_slash)
+            snprintf(fullpath, pathlen, "%s/%s", dirpath, entry->d_name);
+        else
+            snprintf(fullpath, pathlen, "%s%s", dirpath, entry->d_name);
+
+        paths[count++] = fullpath;
+    }
+    closedir(dir);
+
+    if (count == 0) {
+        free(paths);
+        return -1;
+    }
+
+    qsort(paths, (size_t)count, sizeof(*paths), compare_strings);
+
+    if (count > MAX_FRAMES) {
+        fprintf(stderr, "Warning: %d frames found, using first %d.\n", count, MAX_FRAMES);
+        for (int i = MAX_FRAMES; i < count; ++i)
+            free(paths[i]);
+        count = MAX_FRAMES;
+    }
+
+    *out_paths = paths;
+    *out_count = count;
+    return 0;
+}
+
+static Window find_desktop_window(Display *display, int screen) {
+    Atom net_client_list = XInternAtom(display, "_NET_CLIENT_LIST", False);
+    Atom net_wm_window_type = XInternAtom(display, "_NET_WM_WINDOW_TYPE", False);
+    Atom net_wm_type_desktop = XInternAtom(display, "_NET_WM_WINDOW_TYPE_DESKTOP", False);
+
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = NULL;
+
+    if (XGetWindowProperty(display, RootWindow(display, screen),
+                           net_client_list, 0, 1024, False,
+                           XA_WINDOW, &actual_type, &actual_format,
+                           &nitems, &bytes_after, &prop) != Success || !prop)
+        return 0;
+
+    Window *windows = (Window *)prop;
+    Window result = 0;
+    for (unsigned long i = 0; i < nitems; i++) {
+        unsigned char *type_prop = NULL;
+        unsigned long type_nitems, type_bytes;
+        int type_format;
+        Atom type_actual;
+        if (XGetWindowProperty(display, windows[i],
+                               net_wm_window_type, 0, 1, False,
+                               XA_ATOM, &type_actual, &type_format,
+                               &type_nitems, &type_bytes, &type_prop) == Success && type_prop) {
+            if (*(Atom *)type_prop == net_wm_type_desktop)
+                result = windows[i];
+            XFree(type_prop);
+            if (result)
+                break;
+        }
+    }
+    XFree(prop);
+    return result;
+}
+
+static Pixmap update_window_frame(
+    Display *display,
+    int screen,
+    Window window,
+    const char *image_path,
+    Pixmap old_pixmap) {
+    Window root = RootWindow(display, screen);
+    int screen_width = DisplayWidth(display, screen);
+    int screen_height = DisplayHeight(display, screen);
+
+    int image_width = 0;
+    int image_height = 0;
+    unsigned char *source_pixels = read_image_as_bgra(image_path, &image_width, &image_height);
+    if (!source_pixels)
+        return 0;
+
+    unsigned char *pixels = scale_bgra_cover(
+        source_pixels, image_width, image_height,
+        screen_width, screen_height);
+    free(source_pixels);
+    if (!pixels)
+        return 0;
+
+    XImage *image = XCreateImage(
+        display,
+        DefaultVisual(display, screen),
+        DefaultDepth(display, screen),
+        ZPixmap, 0,
+        (char *)pixels,
+        screen_width, screen_height,
+        32, 0);
+    if (!image) {
+        free(pixels);
+        return 0;
+    }
+
+    Pixmap pixmap = XCreatePixmap(
+        display, root,
+        (unsigned int)screen_width,
+        (unsigned int)screen_height,
+        DefaultDepth(display, screen));
+    if (!pixmap) {
+        image->data = NULL;
+        XDestroyImage(image);
+        free(pixels);
+        return 0;
+    }
+
+    XPutImage(display, pixmap, DefaultGC(display, screen), image,
+              0, 0, 0, 0,
+              (unsigned int)screen_width,
+              (unsigned int)screen_height);
+
+    XCopyArea(display, pixmap, window, DefaultGC(display, screen),
+              0, 0,
+              (unsigned int)screen_width,
+              (unsigned int)screen_height,
+              0, 0);
+    XFlush(display);
+
+    if (old_pixmap)
+        XFreePixmap(display, old_pixmap);
+
+    image->data = NULL;
+    XDestroyImage(image);
+    free(pixels);
+
+    return pixmap;
 }
 
 static int create_desktop_wallpaper_window(
@@ -419,12 +633,76 @@ static int create_desktop_wallpaper_window(
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2 || argc > 3) {
+    if (argc < 2) {
         print_usage(argv[0]);
         return EXIT_BAD_USAGE;
     }
 
-    bool foreground = (argc == 3 && strcmp(argv[2], "--foreground") == 0);
+    const char *target = argv[1];
+    bool foreground = false;
+    int fps = DEFAULT_FPS;
+
+    for (int i = 2; i < argc; ++i) {
+        if (strcmp(argv[i], "--foreground") == 0) {
+            foreground = true;
+        } else if (strcmp(argv[i], "--fps") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --fps requires a value.\n");
+                return EXIT_BAD_USAGE;
+            }
+            fps = atoi(argv[++i]);
+            if (fps < 1)
+                fps = 1;
+            if (fps > MAX_FPS)
+                fps = MAX_FPS;
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            print_usage(argv[0]);
+            return EXIT_BAD_USAGE;
+        }
+    }
+
+    struct stat st;
+    if (stat(target, &st) != 0) {
+        perror(target);
+        return EXIT_RUNTIME_ERROR;
+    }
+
+    bool animated = S_ISDIR(st.st_mode);
+
+    if (!animated && is_video_file(target)) {
+        if (system("command -v ffmpeg >/dev/null 2>&1") != 0) {
+            fprintf(stderr, "Error: ffmpeg not found.\n");
+            fprintf(stderr, "\n");
+            fprintf(stderr, "Video files cannot be used directly without ffmpeg.\n");
+            fprintf(stderr, "You can extract frames using ffmpeg or an online frame extractor.\n");
+            fprintf(stderr, "\n");
+            fprintf(stderr, "With ffmpeg:\n");
+            fprintf(stderr, "  mkdir -p ~/frames\n");
+            fprintf(stderr, "  ffmpeg -i \"%s\" -vf fps=%d ~/frames/frame_%%04d.png\n", target, fps);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "With an online tool: search 'video to frames extractor' in your browser,\n");
+            fprintf(stderr, "download the frames as a zip, extract them into a folder (e.g. ~/frames/).\n");
+            fprintf(stderr, "\n");
+            fprintf(stderr, "Then run:\n");
+            fprintf(stderr, "  xwpbg ~/frames/ --fps %d\n", fps);
+            return EXIT_RUNTIME_ERROR;
+        }
+        snprintf(g_temp_dir, sizeof(g_temp_dir), "/tmp/xwpbg_XXXXXX");
+        if (!mkdtemp(g_temp_dir)) {
+            perror("mkdtemp");
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "Extracting frames from video at %d fps...\n", fps);
+        if (extract_video_frames(target, g_temp_dir, fps) != 0) {
+            fprintf(stderr, "ffmpeg failed.\n");
+            rmdir(g_temp_dir);
+            return EXIT_RUNTIME_ERROR;
+        }
+        target = g_temp_dir;
+        animated = true;
+    }
+
     if (!foreground && daemonize_process() != 0) {
         perror("daemonize");
         return EXIT_RUNTIME_ERROR;
@@ -441,35 +719,101 @@ int main(int argc, char **argv) {
         return EXIT_RUNTIME_ERROR;
     }
 
-    Window wallpaper_window = 0;
-    Pixmap wallpaper_pixmap = 0;
-    XImage *wallpaper_image = NULL;
-    unsigned char *wallpaper_pixels = NULL;
+    int screen = DefaultScreen(display);
 
-    if (create_desktop_wallpaper_window(
-            display,
-            DefaultScreen(display),
-            argv[1],
-            &wallpaper_window,
-            &wallpaper_pixmap,
-            &wallpaper_image,
-            &wallpaper_pixels) != 0) {
-        fprintf(stderr, "Failed to create desktop wallpaper window.\n");
-        XCloseDisplay(display);
-        return EXIT_RUNTIME_ERROR;
+    if (animated) {
+        char **frame_paths = NULL;
+        int frame_count = 0;
+
+        if (load_frame_paths(target, &frame_paths, &frame_count) != 0) {
+            fprintf(stderr, "No valid image frames found in: %s\n", target);
+            XCloseDisplay(display);
+            return EXIT_RUNTIME_ERROR;
+        }
+
+        fprintf(stderr, "Found %d frames, running at %d fps...\n", frame_count, fps);
+
+        Window anim_window = find_desktop_window(display, screen);
+        if (!anim_window) {
+            fprintf(stderr, "Failed to find desktop window.\n");
+            for (int i = 0; i < frame_count; ++i)
+                free(frame_paths[i]);
+            free(frame_paths);
+            XCloseDisplay(display);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "Drawing to desktop window: 0x%lx\n", anim_window);
+
+        long frame_usec = 1000000L / fps;
+        int current_frame = 0;
+        Pixmap current_pixmap = 0;
+
+        while (g_running) {
+            struct timespec t0;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+
+            Pixmap new_pixmap = update_window_frame(
+                display, screen, anim_window,
+                frame_paths[current_frame],
+                current_pixmap);
+
+            if (new_pixmap)
+                current_pixmap = new_pixmap;
+
+            current_frame = (current_frame + 1) % frame_count;
+
+            struct timespec t1;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            long elapsed = (t1.tv_sec - t0.tv_sec) * 1000000L
+                         + (t1.tv_nsec - t0.tv_nsec) / 1000L;
+            long remaining = frame_usec - elapsed;
+            if (remaining > 0)
+                usleep((useconds_t)remaining);
+        }
+
+        if (current_pixmap)
+            XFreePixmap(display, current_pixmap);
+
+        for (int i = 0; i < frame_count; ++i)
+            free(frame_paths[i]);
+        free(frame_paths);
+    } else {
+        Window wallpaper_window = 0;
+        Pixmap wallpaper_pixmap = 0;
+        XImage *wallpaper_image = NULL;
+        unsigned char *wallpaper_pixels = NULL;
+
+        if (create_desktop_wallpaper_window(
+                display, screen, target,
+                &wallpaper_window,
+                &wallpaper_pixmap,
+                &wallpaper_image,
+                &wallpaper_pixels) != 0) {
+            fprintf(stderr, "Failed to create desktop wallpaper window.\n");
+            XCloseDisplay(display);
+            return EXIT_RUNTIME_ERROR;
+        }
+
+        while (g_running) {
+            XLowerWindow(display, wallpaper_window);
+            XFlush(display);
+            sleep(5);
+        }
+
+        XDestroyWindow(display, wallpaper_window);
+        XFreePixmap(display, wallpaper_pixmap);
+        wallpaper_image->data = NULL;
+        XDestroyImage(wallpaper_image);
+        free(wallpaper_pixels);
     }
 
-    while (g_running) {
-        XLowerWindow(display, wallpaper_window);
-        XFlush(display);
-        sleep(5);
-    }
-
-    XDestroyWindow(display, wallpaper_window);
-    XFreePixmap(display, wallpaper_pixmap);
-    wallpaper_image->data = NULL;
-    XDestroyImage(wallpaper_image);
-    free(wallpaper_pixels);
     XCloseDisplay(display);
+
+    if (g_temp_dir[0]) {
+        char cmd[300];
+        snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", g_temp_dir);
+        system(cmd);
+    }
+
     return EXIT_OK;
 }
